@@ -195,8 +195,13 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ needs.prepare.outputs.version }}
           PRERELEASE: ${{ needs.prepare.outputs.prerelease }}
+          RUN_RESULT: ${{ needs.run.result }}
         run: |
           uv run python -m src.scripts.logs combine-logs logs | sed "s/{TAG}/$TAG/g" > final.md
+          if [ "$RUN_RESULT" != "success" ]; then
+            # Picked up by src/scripts/matrix.py so the next scheduled CI run retries this brand
+            printf '\n> ⚠️ » Some apps failed to build, they will be retried automatically on the next run\n<!-- build-incomplete -->\n' >> final.md
+          fi
           if [ "$PRERELEASE" = "true" ]; then
             gh release edit "$TAG" --repo "$GITHUB_REPOSITORY" --draft=false --prerelease --title "$TAG" --notes-file final.md
           else
