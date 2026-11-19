@@ -15,12 +15,18 @@
 import json  # noqa: I001
 import os
 import sys
-from datetime import datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any
 
 from src.core.config import CONFIG_PATH, AppEntry, load_toml, parse_app_entries, parse_config
-from src.core.logger import IS_GITHUB, abort, epr
+from src.core.logger import IS_GITHUB, abort, epr, wpr
 from src.core.network import NetworkManager, ResourceNotFoundError
+
+
+# Hidden marker appended to release notes by build.yml when at least one app failed to build
+INCOMPLETE_MARKER = "<!-- build-incomplete -->"
+# A partially failed build is retried on following runs while the upstream patches release is younger than this
+_RETRY_WINDOW = timedelta(days=3)
 
 
 def _require_ci(script: str) -> None:
@@ -46,8 +52,9 @@ def _fetch_latest_release(source: str, net: NetworkManager, version: str = "late
         upstream_date = str(upstream_rel.get("published_at") or "")
     return changelog_text, upstream_date
 
-def _fetch_our_releases(repo: str, net: NetworkManager) -> dict[str, str]:
-    our_releases_by_brand: dict[str, str] = {}
+def _fetch_our_releases(repo: str, net: NetworkManager) -> dict[str, tuple[str, bool]]:
+    """Return {brand: (published_at, is_incomplete)} for the latest release of each brand."""
+    our_releases_by_brand: dict[str, tuple[str, bool]] = {}
     try:
         our_releases_raw = net.get(f"https://api.github.com/repos/{repo}/releases?per_page=100", headers=net.gh_headers)
         releases: list[dict[str, Any]] = json.loads(our_releases_raw)
@@ -55,11 +62,17 @@ def _fetch_our_releases(repo: str, net: NetworkManager) -> dict[str, str]:
             tag = str(rel.get("tag_name") or "")
             brand = tag.split("-", 1)[1] if "-" in tag else ""
             if brand and brand not in our_releases_by_brand:
-                our_releases_by_brand[brand] = str(rel.get("published_at") or "")
+                incomplete = INCOMPLETE_MARKER in str(rel.get("body") or "")
+                our_releases_by_brand[brand] = (str(rel.get("published_at") or ""), incomplete)
     except Exception as exc:
         epr(f"Failed to fetch our releases: {exc}")
         our_releases_by_brand = {}
     return our_releases_by_brand
+
+def _should_retry_incomplete(upstream_date: str) -> bool:
+    if not upstream_date:
+        return False
+    return datetime.now(UTC) - datetime.fromisoformat(upstream_date) < _RETRY_WINDOW
 
 def _load_entries() -> list[AppEntry]:
     data = load_toml(CONFIG_PATH)
@@ -89,7 +102,7 @@ def get_matrix(source: str) -> None:
             repo = os.getenv("GITHUB_REPOSITORY")
             if repo:
                 our_releases_by_brand = _fetch_our_releases(repo, net)
-                if our_releases_by_brand.get(source_lower, ""):
+                if our_releases_by_brand.get(source_lower, ("", False))[0]:
                     try:
                         changelog_text, _ = _fetch_latest_release(patches_source, net)
                     except Exception as exc:
@@ -144,7 +157,7 @@ def check_builds_needed(force_all: bool = False) -> None:
 
         brands_to_build: list[str] = []
         for brand, patches_source in seen.items():
-            our_date = our_releases_by_brand.get(brand, "")
+            our_date, our_incomplete = our_releases_by_brand.get(brand, ("", False))
             try:
                 changelog_text, upstream_date = _fetch_latest_release(patches_source, net, version="dev" if brand in dev_brands else "latest")
             except ResourceNotFoundError:
@@ -156,6 +169,9 @@ def check_builds_needed(force_all: bool = False) -> None:
                 continue
 
             if not our_date:
+                brands_to_build.append(brand)
+            elif our_incomplete and _should_retry_incomplete(upstream_date):
+                wpr(f"Latest '{brand}' release is incomplete (some apps failed to build), retrying")
                 brands_to_build.append(brand)
             elif upstream_date and datetime.fromisoformat(upstream_date) > datetime.fromisoformat(our_date):
                 changelog_lower = changelog_text.lower()
